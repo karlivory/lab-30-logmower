@@ -1,0 +1,317 @@
+---
+apiVersion: codemowers.io/v1alpha1
+kind: GeneratedSecret
+metadata:
+  name: logmower-readwrite-password
+spec:
+  mapping:
+    - key: password
+      value: "%(password)s"
+---
+apiVersion: codemowers.io/v1alpha1
+kind: GeneratedSecret
+metadata:
+  name: logmower-readonly-password
+spec:
+  mapping:
+    - key: password
+      value: "%(password)s"
+---
+apiVersion: mongodbcommunity.mongodb.com/v1
+kind: MongoDBCommunity
+metadata:
+  name: logmower-mongodb
+spec:
+  additionalMongodConfig:
+    systemLog:
+      quiet: true
+  members: 3
+  type: ReplicaSet
+  version: "6.0.2"
+  security:
+    authentication:
+      modes: ["SCRAM"]
+  users:
+    - name: readwrite
+      db: application
+      passwordSecretRef:
+        name: logmower-readwrite-password
+      roles:
+        - name: readWrite
+          db: application
+      scramCredentialsSecretName: logmower-readwrite
+    - name: readonly
+      db: application
+      passwordSecretRef:
+        name: logmower-readonly-password
+      roles:
+        - name: read
+          db: application
+      scramCredentialsSecretName: logmower-readonly
+  statefulSet:
+    spec:
+      logLevel: WARN
+      template:
+        spec:
+          containers:
+            - name: mongod
+              imagePullPolicy: IfNotPresent
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 1Gi
+                limits:
+                  cpu: 1000m
+                  memory: 1Gi
+            - name: mongodb-agent
+              imagePullPolicy: IfNotPresent
+              resources:
+                requests:
+                  cpu: 1m
+                  memory: 100Mi
+                limits: {}
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchExpressions:
+                      - key: app
+                        operator: In
+                        values:
+                          - logmower-svc
+                  topologyKey: kubernetes.io/hostname
+      volumeClaimTemplates:
+        - metadata:
+            name: logs-volume
+          spec:
+            storageClassName: openebs-hostpath
+            accessModes:
+            - ReadWriteOnce
+            resources:
+              requests:
+                storage: 512Mi
+        - metadata:
+            name: data-volume
+          spec:
+            storageClassName: openebs-hostpath
+            accessModes:
+            - ReadWriteOnce
+            resources:
+              requests:
+                storage: 10Gi
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: logmower-shipper
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 50%
+  selector:
+    matchLabels:
+      app: logmower-shipper
+  template:
+    metadata:
+      labels:
+        app: logmower-shipper
+    spec:
+      serviceAccountName: logmower-shipper
+      containers:
+        - name: logmower-shipper
+          image: harbor.k-space.ee/k-space/logmower-shipper-prototype
+          securityContext:
+            runAsUser: 0
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: MONGO_URI
+              valueFrom:
+                secretKeyRef:
+                  name: logmower-mongodb-application-readwrite
+                  key: connectionString.standard
+          ports:
+            - containerPort: 8000
+              name: metrics
+          command:
+            - /app/log_shipper.py
+            - --namespace
+            - $(POD_NAMESPACE)
+            - --parse-json
+            - --normalize-log-level
+            - --stream-to-log-level
+            - --merge-top-level
+            - --max-collection-size
+            - "100000000"
+          resources:
+            limits:
+              memory: 200Mi
+            requests:
+              cpu: 100m
+              memory: 100Mi
+          volumeMounts:
+            - name: etcmachineid
+              mountPath: /etc/machine-id
+              readOnly: true
+            - name: varlibdockercontainers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+            - name: varlog
+              mountPath: /var/log
+              readOnly: true
+      volumes:
+        - name: etcmachineid
+          hostPath:
+            path: /etc/machine-id
+        - name: varlibdockercontainers
+          hostPath:
+            path: /var/lib/docker/containers
+        - name: varlog
+          hostPath:
+            path: /var/log
+      tolerations:
+        - operator: "Exists"
+          effect: "NoSchedule"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: logging-logmower-shipper
+subjects:
+  - kind: ServiceAccount
+    name: logmower-shipper
+    namespace: logmower
+roleRef:
+  kind: ClusterRole
+  name: filebeat
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: logmower-shipper
+  labels:
+    app: logmower-shipper
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: logmower-shipper
+spec:
+  selector:
+    matchLabels:
+      app: logmower-shipper
+  podMetricsEndpoints:
+    - port: metrics
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: logmower
+  annotations:
+    kubernetes.io/ingress.class: shared
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    external-dns.alpha.kubernetes.io/target: traefik.codemowers.ee
+spec:
+  rules:
+  - host: log-laurivosandi.codemowers.ee
+    http:
+      paths:
+      - pathType: Prefix
+        path: "/events"
+        backend:
+          service:
+            name: logmower-eventsource
+            port:
+              number: 3002
+      - pathType: Prefix
+        path: "/"
+        backend:
+          service:
+            name: logmower-frontend
+            port:
+              number: 8080
+  tls:
+  - hosts:
+    - "*.codemowers.ee"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: logmower-eventsource
+spec:
+  type: ClusterIP
+  selector:
+    app: logmower-eventsource
+  ports:
+    - protocol: TCP
+      port: 3002
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: logmower-frontend
+spec:
+  type: ClusterIP
+  selector:
+    app: logmower-frontend
+  ports:
+    - protocol: TCP
+      port: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logmower-frontend
+spec:
+  selector:
+    matchLabels:
+      app: logmower-frontend
+  template:
+    metadata:
+      labels:
+        app: logmower-frontend
+    spec:
+      containers:
+      - name: logmower-frontend
+        image: harbor.k-space.ee/k-space/logmower-frontend
+        ports:
+        - containerPort: 8080
+          name: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logmower-eventsource
+spec:
+  selector:
+    matchLabels:
+      app: logmower-eventsource
+  template:
+    metadata:
+      labels:
+        app: logmower-eventsource
+    spec:
+      containers:
+      - name: logmower-eventsource
+        image: harbor.k-space.ee/k-space/logmower-eventsource
+        command:
+          - npm
+          - start
+        ports:
+          - containerPort: 3002
+            name: nodejs
+        env:
+          - name: MONGODB_HOST
+            valueFrom:
+              secretKeyRef:
+                name: logmower-mongodb-application-readonly
+                key: connectionString.standard
