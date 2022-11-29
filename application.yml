@@ -183,11 +183,11 @@ spec:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: logging-logmower-shipper
+  name: logging-logmower-shipper-karl
 subjects:
   - kind: ServiceAccount
     name: logmower-shipper
-    namespace: logmower
+    namespace: karlivory-774t9
 roleRef:
   kind: ClusterRole
   name: filebeat
@@ -222,7 +222,7 @@ metadata:
     external-dns.alpha.kubernetes.io/target: traefik.codemowers.ee
 spec:
   rules:
-  - host: log-laurivosandi.codemowers.ee
+  - host: karlivory-log.codemowers.ee
     http:
       paths:
       - pathType: Prefix
